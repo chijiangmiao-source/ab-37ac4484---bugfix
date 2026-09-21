@@ -1,0 +1,30 @@
+services:
+  api:
+    build: .
+    image: chunked-upload-api:latest
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - upload-data:/data
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  verify:
+    image: chunked-upload-api:latest
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://api:8000
+    command: ["python", "-m", "app.verify"]
+    restart: "no"
+
+volumes:
+  upload-data:
