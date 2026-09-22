@@ -26,7 +26,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     db = Database(settings.data_dir / "db.sqlite3")
     store = ChunkStore(settings.data_dir)
     reconcile(db, store)
-    service = UploadService(db, store)
+    service = UploadService(db, store, inflight_wait_timeout=settings.inflight_wait_timeout)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -41,6 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             status_code=exc.status_code,
             content=error_body(exc.code, exc.message, exc.details),
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)

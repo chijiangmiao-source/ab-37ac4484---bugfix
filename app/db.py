@@ -87,7 +87,13 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def reserve_chunk_with_bitmap(self, rec: dict, bitmap: bytes) -> None:
+    def commit_chunk_with_bitmap(self, rec: dict, bitmap: bytes) -> None:
+        """Record a fully verified chunk and set its bitmap bit atomically.
+
+        Must be called only after the chunk body is durably in place at
+        rec["path"]: a row existing (and a bitmap bit being set) is the single
+        source of truth used by status, finalize and post-restart reconcile.
+        """
         with self.lock, self._conn:
             self._conn.execute(
                 "INSERT INTO chunks (session_id, chunk_index, size, sha256, path, received_at)"
@@ -98,29 +104,6 @@ class Database:
                 "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
                 (bitmap, rec["session_id"]),
             )
-
-    def cancel_chunk_reservation(self, session_id: str, index: int, digest: str) -> None:
-        with self.lock, self._conn:
-            row = self._conn.execute(
-                "SELECT sha256 FROM chunks WHERE session_id = ? AND chunk_index = ?",
-                (session_id, index),
-            ).fetchone()
-            if row is None or row["sha256"] != digest:
-                return
-            self._conn.execute(
-                "DELETE FROM chunks WHERE session_id = ? AND chunk_index = ?",
-                (session_id, index),
-            )
-            session = self._conn.execute(
-                "SELECT bitmap FROM sessions WHERE session_id = ?", (session_id,)
-            ).fetchone()
-            if session is not None:
-                bitmap = bytearray(session["bitmap"])
-                bitmap[index >> 3] &= ~(1 << (index & 7))
-                self._conn.execute(
-                    "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
-                    (bytes(bitmap), session_id),
-                )
 
     def delete_chunk(self, session_id: str, index: int) -> None:
         with self.lock, self._conn:

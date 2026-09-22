@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import datetime
@@ -18,10 +19,28 @@ from .storage import ChunkStore
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+class _InFlight:
+    """A chunk upload whose body is still streaming / not yet durable.
+
+    Only the holder may write the chunk file and the chunks row; concurrent
+    requests wait on ``done`` and then re-observe the committed state.
+    """
+
+    __slots__ = ("done",)
+
+    def __init__(self) -> None:
+        self.done = asyncio.Event()
+
+
 class UploadService:
-    def __init__(self, db: Database, store: ChunkStore):
+    def __init__(self, db: Database, store: ChunkStore, inflight_wait_timeout: float = 30.0):
         self.db = db
         self.store = store
+        # How long a concurrent retry waits for an in-flight upload before
+        # receiving a structured "still in progress" response.
+        self.inflight_wait_timeout = inflight_wait_timeout
+        self._inflight: dict[tuple[str, int], _InFlight] = {}
+        self._inflight_lock = asyncio.Lock()
 
     # ---- sessions ----
 
@@ -85,12 +104,93 @@ class UploadService:
                 {"received": declared_digest},
             )
 
-        tmp: Path | None = None
-        reserved = False
+        key = (session_id, index)
+        slot: _InFlight | None = None
+        # A request that arrives while another is in flight has its body
+        # spooled to a private temp file while it waits: the HTTP request body
+        # must be consumed before any response is sent, and if the holder fails
+        # the waiting retry can be promoted without asking the client twice.
+        spooled: tuple[Path, int, str] | None = None
+        final_path: Path | None = None
         committed = False
         try:
+            while True:
+                with self.db.lock:
+                    session = self.get_session_or_404(session_id)
+                    existing = self.db.get_chunk(session_id, index)
+                    if existing is not None:
+                        if existing["sha256"] == digest:
+                            return self._chunk_receipt(session, existing, duplicate=True), 200
+                        raise ApiError(
+                            409,
+                            "CHUNK_CONFLICT",
+                            "chunk index already holds different content; the stored chunk is unchanged",
+                            {
+                                "chunk_index": index,
+                                "stored_sha256": existing["sha256"],
+                                "rejected_sha256": digest,
+                            },
+                        )
+                    if self.is_expired(session):
+                        raise ApiError(
+                            410,
+                            "SESSION_EXPIRED",
+                            "session has expired; new chunks are rejected",
+                            {"expires_at": session["expires_at"]},
+                        )
+                    if session["status"] != "active":
+                        raise ApiError(
+                            409,
+                            "SESSION_ALREADY_COMPLETED",
+                            "session is already completed and immutable",
+                        )
+                    expected = self.expected_chunk_size(session, index)
+                    final_path = self.store.chunk_path(session_id, index)
+
+                outcome, target = await self._claim_inflight_slot(key)
+                if outcome == "acquired":
+                    slot = target
+                    break
+
+                # Another upload owns the chunk slot. Drain our own body first
+                # so the connection stays usable for the response, then wait
+                # for the holder's outcome.
+                if spooled is None:
+                    spooled = await self.store.write_chunk_tmp(session_id, stream)
+                try:
+                    await asyncio.wait_for(
+                        target.done.wait(), timeout=self.inflight_wait_timeout
+                    )
+                except asyncio.TimeoutError:
+                    raise ApiError(
+                        409,
+                        "CHUNK_UPLOAD_IN_PROGRESS",
+                        "another upload for this chunk is still in progress; retry after it finishes",
+                        {"chunk_index": index, "retry_after_seconds": 1},
+                        headers={"Retry-After": "1"},
+                    ) from None
+                # The holder released the slot; re-observe durable state and
+                # either take over as holder or report the committed result.
+                continue
+
+            # This request owns the slot. Re-check mutable session state, then
+            # make the body durable without any progress record existing.
             with self.db.lock:
                 session = self.get_session_or_404(session_id)
+                if self.is_expired(session):
+                    raise ApiError(
+                        410,
+                        "SESSION_EXPIRED",
+                        "session has expired; new chunks are rejected",
+                        {"expires_at": session["expires_at"]},
+                    )
+                if session["status"] != "active":
+                    raise ApiError(
+                        409,
+                        "SESSION_ALREADY_COMPLETED",
+                        "session is already completed and immutable",
+                    )
+                # The slot serializes writers, so this is defensive only.
                 existing = self.db.get_chunk(session_id, index)
                 if existing is not None:
                     if existing["sha256"] == digest:
@@ -105,36 +205,10 @@ class UploadService:
                             "rejected_sha256": digest,
                         },
                     )
-                if self.is_expired(session):
-                    raise ApiError(
-                        410,
-                        "SESSION_EXPIRED",
-                        "session has expired; new chunks are rejected",
-                        {"expires_at": session["expires_at"]},
-                    )
-                if session["status"] != "active":
-                    raise ApiError(
-                        409,
-                        "SESSION_ALREADY_COMPLETED",
-                        "session is already completed and immutable",
-                    )
-                expected = self.expected_chunk_size(session, index)
-                final_path = self.store.chunk_path(session_id, index)
-                record = {
-                    "session_id": session_id,
-                    "chunk_index": index,
-                    "size": expected,
-                    "sha256": digest,
-                    "path": str(final_path),
-                    "received_at": clock.utcnow().isoformat(),
-                }
-                bitmap = bytearray(session["bitmap"])
-                set_bit(bitmap, index)
-                session["bitmap"] = bytes(bitmap)
-                self.db.reserve_chunk_with_bitmap(record, session["bitmap"])
-                reserved = True
 
-            tmp, size, actual = await self.store.write_chunk_tmp(session_id, stream)
+            if spooled is None:
+                spooled = await self.store.write_chunk_tmp(session_id, stream)
+            tmp, size, actual = spooled
             if size != expected:
                 raise ApiError(
                     400,
@@ -149,15 +223,53 @@ class UploadService:
                     "chunk body SHA-256 does not match X-Chunk-SHA256; chunk was discarded",
                     {"chunk_index": index, "declared_sha256": digest, "actual_sha256": actual},
                 )
+
+            assert final_path is not None
+            # Verified body becomes durable at its final path first; only then
+            # is it recorded, so every 2xx corresponds to a file + row + bit.
             self.store.commit_tmp(tmp, final_path)
+            spooled = None
+            record = {
+                "session_id": session_id,
+                "chunk_index": index,
+                "size": expected,
+                "sha256": digest,
+                "path": str(final_path),
+                "received_at": clock.utcnow().isoformat(),
+            }
+            try:
+                with self.db.lock:
+                    session = self.get_session_or_404(session_id)
+                    bitmap = bytearray(session["bitmap"])
+                    set_bit(bitmap, index)
+                    self.db.commit_chunk_with_bitmap(record, bytes(bitmap))
+            except BaseException:
+                # The DB row is the source of truth; never leave an
+                # acknowledged file without it (reconcile would also reap it).
+                self.store.discard(final_path)
+                raise
             committed = True
-            return self._chunk_receipt(session, record, duplicate=False), 201
+            return (
+                self._chunk_receipt(self.get_session_or_404(session_id), record, duplicate=False),
+                201,
+            )
         finally:
-            if reserved and not committed:
-                self.db.cancel_chunk_reservation(session_id, index, digest)
-            if not committed:
-                if tmp is not None:
-                    self.store.discard(tmp)
+            if not committed and spooled is not None:
+                self.store.discard(spooled[0])
+            if slot is not None:
+                async with self._inflight_lock:
+                    self._inflight.pop(key, None)
+                slot.done.set()
+
+    async def _claim_inflight_slot(self, key: tuple[str, int]) -> tuple[str, _InFlight]:
+        """Acquire the slot for key, or report the holder to wait for."""
+        async with self._inflight_lock:
+            holder = self._inflight.get(key)
+            if holder is not None:
+                return "waiting", holder
+            new_slot = _InFlight()
+            self._inflight[key] = new_slot
+            return "acquired", new_slot
 
     # ---- finalize / artifact ----
 
@@ -307,9 +419,10 @@ def reconcile(db: Database, store: ChunkStore) -> None:
     """Rebuild durable state after a (possibly unclean) restart.
 
     - chunk rows whose files vanished or have a wrong size are dropped;
-    - chunk files without a matching row (crashed before commit) are removed;
+    - chunk files without a matching row (crashed between os.replace and the
+      DB commit) are removed;
     - the persisted bitmap is rebuilt from the surviving rows;
-    - leftover temp files are removed.
+    - leftover temp files (aborted uploads) are removed.
 
     Net effect: confirmed chunks are never reported missing, and unconfirmed
     bytes are never reported as received.
