@@ -32,15 +32,19 @@ class ChunkStore:
     def artifact_path(self, session_id: str) -> Path:
         return self.artifacts_dir / f"{session_id}.bin"
 
-    async def write_chunk_tmp(self, session_id: str, stream: AsyncIterable[bytes]) -> tuple[Path, int, str]:
-        """Stream a request body to a temp file; returns (tmp_path, size, sha256).
-
-        The caller validates size/digest before committing the temp file with
-        commit_tmp(); nothing is visible at the final path until then.
-        """
+    def tmp_path(self, session_id: str) -> Path:
+        """Reserve a unique (not yet opened) temp path for a streaming body."""
         target_dir = self.chunk_dir(session_id)
         target_dir.mkdir(parents=True, exist_ok=True)
-        tmp = target_dir / f".{uuid.uuid4().hex}.tmp"
+        return target_dir / f".{uuid.uuid4().hex}.tmp"
+
+    async def write_chunk_tmp(self, tmp: Path, stream: AsyncIterable[bytes]) -> tuple[int, str]:
+        """Stream a request body into ``tmp``; returns (size, sha256).
+
+        The caller validates size/digest before moving the file into place with
+        commit_tmp(); nothing is visible at the final path until then. The temp
+        file is removed if streaming fails (e.g. the client disconnects).
+        """
         hasher = hashlib.sha256()
         size = 0
         try:
@@ -56,7 +60,7 @@ class ChunkStore:
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-        return tmp, size, hasher.hexdigest()
+        return size, hasher.hexdigest()
 
     def commit_tmp(self, tmp: Path, final: Path) -> None:
         os.replace(tmp, final)

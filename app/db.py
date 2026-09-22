@@ -1,4 +1,11 @@
-"""SQLite persistence: sessions (with received bitmap) and per-chunk digests."""
+"""SQLite persistence: sessions (with received bitmap) and per-chunk digests.
+
+A chunk row starts life in state 'pending' while its body is still streaming:
+it is NOT counted in the session bitmap until state becomes 'confirmed', which
+happens in the same transaction as the bitmap update -- and only after the body
+has been length/digest checked and moved to its final path with os.replace().
+'pending' rows therefore never influence progress and are dropped on restart.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +35,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     sha256      TEXT NOT NULL,
     path        TEXT NOT NULL,
     received_at TEXT NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'pending',
+    tmp_path    TEXT,
     PRIMARY KEY (session_id, chunk_index),
     FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
 );
@@ -47,7 +56,25 @@ class Database:
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate_chunks_table()
             self._conn.commit()
+
+    def _migrate_chunks_table(self) -> None:
+        """Add the state/tmp_path columns to databases created by older versions.
+
+        Every row written by an older version that still has its file is a
+        confirmed chunk; reconcile() rebuilds the bitmap from those rows.
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(chunks)")
+        }
+        if "state" not in columns:
+            self._conn.execute(
+                "ALTER TABLE chunks ADD COLUMN state TEXT NOT NULL DEFAULT 'confirmed'"
+            )
+        if "tmp_path" not in columns:
+            self._conn.execute("ALTER TABLE chunks ADD COLUMN tmp_path TEXT")
 
     def create_session(self, rec: dict) -> None:
         with self.lock, self._conn:
@@ -71,10 +98,11 @@ class Database:
             rows = self._conn.execute("SELECT * FROM sessions ORDER BY created_at").fetchall()
         return [dict(r) for r in rows]
 
-    def get_chunk(self, session_id: str, index: int) -> dict | None:
+    def get_confirmed_chunk(self, session_id: str, index: int) -> dict | None:
         with self.lock:
             row = self._conn.execute(
-                "SELECT * FROM chunks WHERE session_id = ? AND chunk_index = ?",
+                "SELECT * FROM chunks WHERE session_id = ? AND chunk_index = ?"
+                " AND state = 'confirmed'",
                 (session_id, index),
             ).fetchone()
         return dict(row) if row else None
@@ -87,40 +115,43 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def reserve_chunk_with_bitmap(self, rec: dict, bitmap: bytes) -> None:
+    def insert_pending_chunk(self, rec: dict, tmp_path: str) -> None:
+        """Record an in-flight upload. The bitmap is deliberately left untouched."""
         with self.lock, self._conn:
             self._conn.execute(
-                "INSERT INTO chunks (session_id, chunk_index, size, sha256, path, received_at)"
-                " VALUES (:session_id, :chunk_index, :size, :sha256, :path, :received_at)",
-                rec,
-            )
-            self._conn.execute(
-                "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
-                (bitmap, rec["session_id"]),
+                "INSERT INTO chunks (session_id, chunk_index, size, sha256, path,"
+                " received_at, state, tmp_path)"
+                " VALUES (:session_id, :chunk_index, :size, :sha256, :path,"
+                " :received_at, 'pending', :tmp_path)",
+                {**rec, "tmp_path": tmp_path},
             )
 
-    def cancel_chunk_reservation(self, session_id: str, index: int, digest: str) -> None:
+    def commit_pending_chunk(
+        self, session_id: str, index: int, final_path: str, bitmap: bytes
+    ) -> None:
+        """Promote a pending row to confirmed and set its bitmap bit atomically."""
         with self.lock, self._conn:
-            row = self._conn.execute(
-                "SELECT sha256 FROM chunks WHERE session_id = ? AND chunk_index = ?",
-                (session_id, index),
-            ).fetchone()
-            if row is None or row["sha256"] != digest:
-                return
+            cur = self._conn.execute(
+                "UPDATE chunks SET state = 'confirmed', path = ?, tmp_path = NULL"
+                " WHERE session_id = ? AND chunk_index = ? AND state = 'pending'",
+                (final_path, session_id, index),
+            )
+            if cur.rowcount == 0:
+                raise sqlite3.IntegrityError(
+                    f"no pending chunk {session_id}:{index} to commit"
+                )
             self._conn.execute(
-                "DELETE FROM chunks WHERE session_id = ? AND chunk_index = ?",
+                "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
+                (bitmap, session_id),
+            )
+
+    def abort_pending_chunk(self, session_id: str, index: int) -> None:
+        with self.lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM chunks WHERE session_id = ? AND chunk_index = ?"
+                " AND state = 'pending'",
                 (session_id, index),
             )
-            session = self._conn.execute(
-                "SELECT bitmap FROM sessions WHERE session_id = ?", (session_id,)
-            ).fetchone()
-            if session is not None:
-                bitmap = bytearray(session["bitmap"])
-                bitmap[index >> 3] &= ~(1 << (index & 7))
-                self._conn.execute(
-                    "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
-                    (bytes(bitmap), session_id),
-                )
 
     def delete_chunk(self, session_id: str, index: int) -> None:
         with self.lock, self._conn:

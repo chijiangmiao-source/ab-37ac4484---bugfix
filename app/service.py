@@ -1,7 +1,35 @@
-"""Core upload/resume/finalize logic shared by the HTTP routes."""
+"""Core upload/resume/finalize logic shared by the HTTP routes.
+
+Concurrency model for PUT chunk/{index}
+---------------------------------------
+
+A chunk only becomes visible to GET status / finalize *after* its full body has
+been streamed, length- and SHA-256-validated, moved to its final path with
+os.replace() *and* recorded as 'confirmed' together with its bitmap bit in one
+SQLite transaction. While the body is still streaming, at most a 'pending' row
+(which never touches the bitmap) exists.
+
+Concurrent uploads of the same (session, index) coordinate through an in-memory
+gate:
+
+* the first request ("leader") streams and commits;
+* later requests ("followers") drain their own bodies into private temp files
+  (so a paused leader cannot cause TCP back-pressure/deadlock) and wait for the
+  leader;
+* if the leader commits a chunk whose digest matches the follower's header, the
+  follower gets the idempotent ``200 duplicate=true``; a different digest is a
+  ``409 CHUNK_CONFLICT``;
+* if the leader fails, followers serialise on the gate and the first one with a
+  complete, valid body promotes it (``201``), so a legitimate retry after a
+  failed attempt still finishes the upload.
+
+No 2xx is ever returned for a chunk that cannot also be observed as confirmed
+through the status endpoint, finalize, and a process restart.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import datetime
@@ -18,10 +46,21 @@ from .storage import ChunkStore
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+class _Gate:
+    """Coordinates concurrent uploads of one (session, chunk_index)."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.done = asyncio.Event()
+        self.refs = 0
+
+
 class UploadService:
     def __init__(self, db: Database, store: ChunkStore):
         self.db = db
         self.store = store
+        self._gates: dict[tuple[str, int], _Gate] = {}
+        self._registry_lock = asyncio.Lock()
 
     # ---- sessions ----
 
@@ -85,26 +124,107 @@ class UploadService:
                 {"received": declared_digest},
             )
 
-        tmp: Path | None = None
-        reserved = False
-        committed = False
-        try:
-            with self.db.lock:
+        key = (session_id, index)
+
+        # Join phase: either answer from a durably confirmed chunk, reject by
+        # session policy, or join the in-flight gate for this index.
+        async with self._registry_lock:
+            confirmed = self.db.get_confirmed_chunk(session_id, index)
+            if confirmed is not None:
                 session = self.get_session_or_404(session_id)
-                existing = self.db.get_chunk(session_id, index)
-                if existing is not None:
-                    if existing["sha256"] == digest:
-                        return self._chunk_receipt(session, existing, duplicate=True), 200
-                    raise ApiError(
-                        409,
-                        "CHUNK_CONFLICT",
-                        "chunk index already holds different content; the stored chunk is unchanged",
-                        {
-                            "chunk_index": index,
-                            "stored_sha256": existing["sha256"],
-                            "rejected_sha256": digest,
-                        },
-                    )
+                if confirmed["sha256"] == digest:
+                    return self._chunk_receipt(session, confirmed, duplicate=True), 200
+                raise ApiError(
+                    409,
+                    "CHUNK_CONFLICT",
+                    "chunk index already holds different content; the stored chunk is unchanged",
+                    {
+                        "chunk_index": index,
+                        "stored_sha256": confirmed["sha256"],
+                        "rejected_sha256": digest,
+                    },
+                )
+
+            session = self.get_session_or_404(session_id)
+            if self.is_expired(session):
+                raise ApiError(
+                    410,
+                    "SESSION_EXPIRED",
+                    "session has expired; new chunks are rejected",
+                    {"expires_at": session["expires_at"]},
+                )
+            if session["status"] != "active":
+                raise ApiError(
+                    409,
+                    "SESSION_ALREADY_COMPLETED",
+                    "session is already completed and immutable",
+                )
+
+            gate = self._gates.get(key)
+            if gate is None:
+                gate = _Gate()
+                self._gates[key] = gate
+            gate.refs += 1
+            is_leader = gate.refs == 1
+
+        try:
+            if is_leader:
+                return await self._upload_as_leader(gate, session_id, index, digest, stream)
+            return await self._upload_as_follower(gate, session_id, index, digest, stream)
+        finally:
+            async with self._registry_lock:
+                gate.refs -= 1
+                if gate.refs == 0:
+                    self._gates.pop(key, None)
+
+    async def _upload_as_leader(
+        self,
+        gate: _Gate,
+        session_id: str,
+        index: int,
+        digest: str,
+        stream: AsyncIterable[bytes],
+    ) -> tuple[dict, int]:
+        session = self.get_session_or_404(session_id)
+        expected = self.expected_chunk_size(session, index)
+        final_path = self.store.chunk_path(session_id, index)
+        tmp = self.store.tmp_path(session_id)
+        record = {
+            "session_id": session_id,
+            "chunk_index": index,
+            "size": expected,
+            "sha256": digest,
+            "path": str(final_path),
+            "received_at": clock.utcnow().isoformat(),
+        }
+        # Pending row only: the bitmap is not updated until validation + commit.
+        self.db.insert_pending_chunk(record, str(tmp))
+
+        body_error: ApiError | None = None
+        committed_tmp = False
+        try:
+            size, actual = await self.store.write_chunk_tmp(tmp, stream)
+            if size != expected:
+                body_error = ApiError(
+                    400,
+                    "CHUNK_SIZE_MISMATCH",
+                    f"chunk {index} must be exactly {expected} bytes, got {size}",
+                    {"chunk_index": index, "expected_size": expected, "actual_size": size},
+                )
+            elif actual != digest:
+                body_error = ApiError(
+                    400,
+                    "CHUNK_DIGEST_MISMATCH",
+                    "chunk body SHA-256 does not match X-Chunk-SHA256; chunk was discarded",
+                    {"chunk_index": index, "declared_sha256": digest, "actual_sha256": actual},
+                )
+            if body_error is not None:
+                raise body_error
+
+            async with gate.lock:
+                # Re-check policy after the body finished streaming: the
+                # session may have expired (or been finalized) meanwhile.
+                session = self.get_session_or_404(session_id)
                 if self.is_expired(session):
                     raise ApiError(
                         410,
@@ -118,8 +238,97 @@ class UploadService:
                         "SESSION_ALREADY_COMPLETED",
                         "session is already completed and immutable",
                     )
-                expected = self.expected_chunk_size(session, index)
-                final_path = self.store.chunk_path(session_id, index)
+                self.store.commit_tmp(tmp, final_path)
+                self._commit_bitmap(session_id, index, str(final_path))
+                committed_tmp = True
+                confirmed = self.db.get_confirmed_chunk(session_id, index)
+            session = self.get_session_or_404(session_id)
+            return self._chunk_receipt(session, confirmed, duplicate=False), 201
+        finally:
+            # Settle durable state before releasing followers: when they take
+            # the gate lock there must no longer be a pending row for the index.
+            if not committed_tmp:
+                self.db.abort_pending_chunk(session_id, index)
+                self.store.discard(tmp)
+            gate.done.set()
+
+    async def _upload_as_follower(
+        self,
+        gate: _Gate,
+        session_id: str,
+        index: int,
+        digest: str,
+        stream: AsyncIterable[bytes],
+    ) -> tuple[dict, int]:
+        session = self.get_session_or_404(session_id)
+        expected = self.expected_chunk_size(session, index)
+        final_path = self.store.chunk_path(session_id, index)
+        tmp = self.store.tmp_path(session_id)
+
+        # Drain this request's body into a private temp file concurrently with
+        # the leader -- never block on the (possibly paused) leader, otherwise
+        # TCP flow control could stall both connections. Any temp file left
+        # behind (by validation failure or disconnect) is cleaned in finally.
+        body_error: ApiError | None = None
+        size = actual = None
+        size, actual = await self.store.write_chunk_tmp(tmp, stream)
+        if size != expected:
+            body_error = ApiError(
+                400,
+                "CHUNK_SIZE_MISMATCH",
+                f"chunk {index} must be exactly {expected} bytes, got {size}",
+                {"chunk_index": index, "expected_size": expected, "actual_size": size},
+            )
+        elif actual != digest:
+            body_error = ApiError(
+                400,
+                "CHUNK_DIGEST_MISMATCH",
+                "chunk body SHA-256 does not match X-Chunk-SHA256; chunk was discarded",
+                {"chunk_index": index, "declared_sha256": digest, "actual_sha256": actual},
+            )
+
+        committed_tmp = False
+        try:
+            await gate.done.wait()
+            async with gate.lock:
+                confirmed = self.db.get_confirmed_chunk(session_id, index)
+                if confirmed is not None:
+                    # Leader (or a prior follower) durably settled this index.
+                    session = self.get_session_or_404(session_id)
+                    if confirmed["sha256"] == digest:
+                        return self._chunk_receipt(session, confirmed, duplicate=True), 200
+                    raise ApiError(
+                        409,
+                        "CHUNK_CONFLICT",
+                        "chunk index already holds different content; the stored chunk is unchanged",
+                        {
+                            "chunk_index": index,
+                            "stored_sha256": confirmed["sha256"],
+                            "rejected_sha256": digest,
+                        },
+                    )
+
+                # Leader failed: a valid retry body may take over, one winner.
+                if body_error is not None:
+                    raise body_error
+                # Re-check policy after waiting: the session may have expired
+                # (or been completed) while this body was streaming.
+                session = self.get_session_or_404(session_id)
+                if self.is_expired(session):
+                    raise ApiError(
+                        410,
+                        "SESSION_EXPIRED",
+                        "session has expired; new chunks are rejected",
+                        {"expires_at": session["expires_at"]},
+                    )
+                if session["status"] != "active":
+                    raise ApiError(
+                        409,
+                        "SESSION_ALREADY_COMPLETED",
+                        "session is already completed and immutable",
+                    )
+                # Sweep any leftover pending row before claiming the index.
+                self.db.abort_pending_chunk(session_id, index)
                 record = {
                     "session_id": session_id,
                     "chunk_index": index,
@@ -128,36 +337,27 @@ class UploadService:
                     "path": str(final_path),
                     "received_at": clock.utcnow().isoformat(),
                 }
-                bitmap = bytearray(session["bitmap"])
-                set_bit(bitmap, index)
-                session["bitmap"] = bytes(bitmap)
-                self.db.reserve_chunk_with_bitmap(record, session["bitmap"])
-                reserved = True
-
-            tmp, size, actual = await self.store.write_chunk_tmp(session_id, stream)
-            if size != expected:
-                raise ApiError(
-                    400,
-                    "CHUNK_SIZE_MISMATCH",
-                    f"chunk {index} must be exactly {expected} bytes, got {size}",
-                    {"chunk_index": index, "expected_size": expected, "actual_size": size},
-                )
-            if actual != digest:
-                raise ApiError(
-                    400,
-                    "CHUNK_DIGEST_MISMATCH",
-                    "chunk body SHA-256 does not match X-Chunk-SHA256; chunk was discarded",
-                    {"chunk_index": index, "declared_sha256": digest, "actual_sha256": actual},
-                )
-            self.store.commit_tmp(tmp, final_path)
-            committed = True
-            return self._chunk_receipt(session, record, duplicate=False), 201
+                self.db.insert_pending_chunk(record, str(tmp))
+                try:
+                    self.store.commit_tmp(tmp, final_path)
+                    self._commit_bitmap(session_id, index, str(final_path))
+                    committed_tmp = True
+                except BaseException:
+                    self.db.abort_pending_chunk(session_id, index)
+                    raise
+                confirmed = self.db.get_confirmed_chunk(session_id, index)
+                session = self.get_session_or_404(session_id)
+                return self._chunk_receipt(session, confirmed, duplicate=False), 201
         finally:
-            if reserved and not committed:
-                self.db.cancel_chunk_reservation(session_id, index, digest)
-            if not committed:
-                if tmp is not None:
-                    self.store.discard(tmp)
+            if not committed_tmp:
+                self.store.discard(tmp)
+
+    def _commit_bitmap(self, session_id: str, index: int, final_path: str) -> None:
+        """Promote the pending row and set its bit in a single transaction."""
+        session = self.get_session_or_404(session_id)
+        bitmap = bytearray(session["bitmap"])
+        set_bit(bitmap, index)
+        self.db.commit_pending_chunk(session_id, index, final_path, bytes(bitmap))
 
     # ---- finalize / artifact ----
 
@@ -306,9 +506,11 @@ class UploadService:
 def reconcile(db: Database, store: ChunkStore) -> None:
     """Rebuild durable state after a (possibly unclean) restart.
 
-    - chunk rows whose files vanished or have a wrong size are dropped;
-    - chunk files without a matching row (crashed before commit) are removed;
-    - the persisted bitmap is rebuilt from the surviving rows;
+    - 'pending' chunk rows (stream interrupted by a crash) are dropped;
+    - confirmed rows whose files vanished or have a wrong size are dropped;
+    - chunk files without a matching confirmed row (crash between replace and
+      commit) are removed;
+    - the persisted bitmap is rebuilt from the surviving confirmed rows;
     - leftover temp files are removed.
 
     Net effect: confirmed chunks are never reported missing, and unconfirmed
@@ -318,6 +520,9 @@ def reconcile(db: Database, store: ChunkStore) -> None:
         session_id = session["session_id"]
         confirmed: set[int] = set()
         for row in db.list_chunks(session_id):
+            if row.get("state") != "confirmed":
+                db.delete_chunk(session_id, row["chunk_index"])
+                continue
             path = Path(row["path"])
             if path.exists() and path.stat().st_size == row["size"]:
                 confirmed.add(row["chunk_index"])
